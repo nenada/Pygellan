@@ -7,7 +7,85 @@ import numpy as np
 import sys
 import json
 import platform
-import dask.array as da
+
+
+class SummaryMeta:
+    """
+    Summary metadata represents the entire data set
+    Assumed to be set before acquisition starts(?)
+    """
+    # MANDATORY
+    # ---------
+    PREFIX = "Prefix" # serves as a "name"
+    SOURCE = "Source" # source application
+
+    # Multi-D coordinate space (sparse)
+    # this represents intended coordinate space limits
+    # it is OK if some images are missing
+    CHANNELS = "Channels"
+    SLICES = "Slices"
+    FRAMES = "Frames"
+    POSITIONS = "Positions"
+    CHANNEL_NAMES = "ChNames"
+    CHANNEL_COLORS = "Colors"
+
+    # image format
+    # are these constraints for the entire data set?
+    WIDTH = "WIDTH"
+    HEIGHT = "HEIGHT"
+    PIXEL_TYPE = "PixelType"
+    PIXEL_SIZE = "PixelSize_um"
+    BIT_DEPTH = "BitDepth"
+    PIXEL_ASPECT = "PixelAspect"
+
+    # OPTIONAL
+    # --------
+    SLICES_FIRST = "SlicesFirst"
+    TIME_FIRST = "TimeFirst"
+    IJ_TYPE = "IJType"
+
+    # problematic?
+    # does this belong in the summary?
+    CHANNEL_MINS = "ChContrastMin"
+    CHANNEL_MAXES = "ChContrastMax"
+    OBJECTIVE_LABEL = "Objective-Label"
+    ELAPSED_TIME = "ElapsedTime-ms" # does not belong here
+
+
+class ImageMeta:
+
+    WIDTH = "Width"
+    HEIGHT = "Height"
+    CHANNEL = "Channel"
+    CHANNEL_NAME = "Channel"  # ?? duplicate
+    FRAME = "Frame" # what about FRAME_INDEX?
+    SLICE = "Slice" # what about SLICE_INDEX?
+    CHANNEL_INDEX = "ChannelIndex"
+    SLICE_INDEX = "SliceIndex"
+    FRAME_INDEX = "FrameIndex"
+    POS_NAME = "PositionName"
+    POS_INDEX = "PositionIndex"
+    XUM = "XPositionUm"
+    YUM = "YPositionUm"
+    ZUM = "ZPositionUm"
+
+    # OPTIONAL
+    # --------
+    IJ_TYPE = "IJType"
+    TIME = "Time" # this belongs in Summary!!!
+    PIX_TYPE = "PixelType" # can this be different from summary?
+    BIT_DEPTH = "BitDepth" # ""?
+    ELAPSED_TIME_MS = "ElapsedTime-ms"
+
+
+class Values:
+    PIX_TYPE_GRAY_32 = "GRAY32"
+    PIX_TYPE_GRAY_16 = "GRAY16"
+    PIX_TYPE_GRAY_8 = "GRAY8"
+    PIX_TYPE_RGB_32 = "RGB32"
+    PIX_TYPE_RGB_64 = "RGB64"
+
+    CHANNEL_DEFAULT = "Default" # what is this?
 
 
 class _MMMultipageTiffReader:
@@ -73,6 +151,7 @@ class _MMMultipageTiffReader:
                 raise Exception("Potential issue with mismatched endian-ness")
         else:
             raise Exception('Endian type not specified correctly')
+
         if np.frombuffer(self.mmap_file[2:4], dtype=np.uint16)[0] != 42:
             raise Exception('Tiff magic 42 missing')
         first_ifd_offset = np.frombuffer(self.mmap_file[4:8], dtype=np.uint32)[0]
@@ -252,21 +331,35 @@ class MMDataset:
     """
 
     def __init__(self, dataset_path):
-        self.path = dataset_path
-        self.dataset = _MMDataSetReader(self.path)
+        self._path = dataset_path
+        self._dataset = _MMDataSetReader(self._path)
 
         # get summary metadata and index tree from full resolution image
-        self.summary_metadata = self.dataset.reader_list[0].summary_md
+        self._summary_metadata = self._dataset.reader_list[0].summary_md
 
         # store some fields explicitly for easy access
-        self.pixel_type = np.uint16 if self.summary_metadata['PixelType'] == 'GRAY16' else np.uint8
-        self.pixel_size_xy_um = self.summary_metadata['PixelSize_um']
-        self.pixel_size_z_um = self.summary_metadata['z-step_um']
-        self.image_width = self.dataset.reader_list[0].width
-        self.image_height = self.dataset.reader_list[0].height
-        self.channel_names = self.summary_metadata['ChNames']
-        self.overlap = np.array([self.summary_metadata['GridPixelOverlapY'], self.summary_metadata['GridPixelOverlapX']])
-        self.c_z_t_p_tree = self.dataset.reader_tree
+        if self._summary_metadata['PixelType'] == 'GRAY16':
+            self.pixel_type = np.uint16
+        elif self._summary_metadata['PixelType'] == 'GRAY8':
+            self.pixel_type = np.uint8
+        else:
+            raise Exception("Unsupported pixel type: " + self._summary_metadata['PixelType'])
+
+        self.pixel_size_xy_um = self._summary_metadata['PixelSize_um']
+        self.pixel_size_z_um = self._summary_metadata['z-step_um']
+        self.image_width = self._dataset.reader_list[0].width
+        self.image_height = self._dataset.reader_list[0].height
+        self.channel_names = self._summary_metadata['ChNames']
+        self.num_channels = self._summary_metadata['Channels']
+
+        if self.num_channels != len(self.channel_names):
+            raise Exception("Channel names do not match number of channels")
+
+        self.num_slices = self._summary_metadata['Slices']
+        self.num_frames = self._summary_metadata['Frames']
+
+        self.overlap = np.array([self._summary_metadata['GridPixelOverlapY'], self._summary_metadata['GridPixelOverlapX']])
+        self.c_z_t_p_tree = self._dataset.reader_tree
 
         # index tree is in c - z - t - p hierarchy, get all used indices to calcualte other orderings
         self.channel_indices = set(self.c_z_t_p_tree.keys())
@@ -299,85 +392,45 @@ class MMDataset:
 
         # get row, col as a function of position index
         self.row_col_tuples = [(pos['GridRowIndex'], pos['GridColumnIndex']) for pos in
-                                  self.summary_metadata['InitialPositionList']]
+                               self._summary_metadata['InitialPositionList']]
         self.row_col_array = np.array([(pos['GridRowIndex'], pos['GridColumnIndex']) for pos in
-                                       self.summary_metadata['InitialPositionList']])
+                                       self._summary_metadata['InitialPositionList']])
 
     def _channel_name_to_index(self, channel_name):
         if channel_name not in self.channel_names:
             raise Exception('Invalid channel name')
         return self.channel_names.index(channel_name)
 
-    def as_stitched_array(self, channel_index=0, channel_name=None, t_index=0, verbose=True):
-        if channel_name is not None:
-            channel_index = self._channel_name_to_index(channel_name)
-        z_list = []
-        for z in self.z_indices:
-            # this doesn't work with explore acquisitions and would need to be updated
-            rows, cols = self.get_num_rows_and_cols()
-            empty_tile = np.zeros((self.image_height, self.image_width), self.pixel_type)
-            row_list = []
-            for row in range(rows):
-                if verbose:
-                    print('stitching row {} of {}'.format(row + 1, rows))
-                col_list = []
-                for col in range(cols):
-                    pos_index_array = np.nonzero(np.logical_and(self.row_col_array[:, 0] == row,
-                                                                self.row_col_array[:, 1] == col))[0]
-                    pos_index = None if pos_index_array.size == 0 else pos_index_array[0]
-                    if pos_index is not None and self.has_image(
-                            channel_index=channel_index, z_index=z, t_index=t_index, pos_index=pos_index):
-                        img = self.read_image(channel_index=channel_index, z_index=z, t_index=t_index, pos_index=pos_index,
-                                              memmapped=True)
-                    else:
-                        img = empty_tile
-                    # crop to center of tile
-                    col_list.append(img[self.overlap[0] // 2: -self.overlap[0] // 2,
-                                    self.overlap[1] // 2: -self.overlap[1] // 2])
-                stitched_col = da.concatenate(col_list, axis=1)
-                row_list.append(stitched_col)
-            stitched = da.concatenate(row_list, axis=0)
-            z_list.append(stitched)
-        return da.stack(z_list)
-
-    def as_array(self, p_axis=True, verbose=True):
+    def get_num_xy_positions(self):
         """
-        Get array representing all the data in the dataset, but mempry map it so as to not overlaod RAM
-        T-P-C-Z
-        :param p_axis: if True, make xy positions it's own axis. If false, stitch together different positions
-        and make x and y axes bigger
-        :return:
+        :return: total number of xy positons in data set
         """
-        #TODO: improve documentation
-        #TODO: should singleton axes be collapsed?
+        return len(list(self.p_t_z_c_tree.keys()))
 
-        if not p_axis: #return
-            tcz_list = []
-            for t in self.frame_indices:
-                cz_list = []
-                for c in self.channel_indices:
-                    cz_list.append(self.as_stitched_array(channel_index=c, t_index=t, verbose=verbose))
-                tcz_list.append(da.stack(cz_list))
-            return da.stack(tcz_list)
-        else:
-            # return tiles stacked on a position axis
-            ptcz_list = []
-            for p in self.position_indices:
-                tcz_list = []
-                for t in self.frame_indices:
-                    cz_list = []
-                    for c in self.channel_indices:
-                        z_list = []
-                        for z in self.z_indices:
-                            if self.has_image(channel_index=c, z_index=z, t_index=t, pos_index=p):
-                                z_list.append(self.read_image(
-                                    channel_index=c, z_index=z, t_index=t, pos_index=p, memmapped=True))
-                            else:
-                                z_list.append(np.zeros((self.image_height, self.image_width), self.pixel_type))
-                        cz_list.append(da.stack(z_list))
-                    tcz_list.append(da.stack(cz_list))
-                ptcz_list.append(da.stack(tcz_list))
-            return da.stack(ptcz_list)
+    def get_num_rows_and_cols(self):
+        """
+        Note doesn't  work with explore acquisitions because initial position list isn't populated here
+        :return: tuple with total number of rows, total number of cols in dataset
+        """
+        row_col_tuples = [(pos['GridRowIndex'], pos['GridColumnIndex']) for pos in
+                          self._summary_metadata['InitialPositionList']]
+        row_indices = list(set(row for row, col in row_col_tuples))
+        col_indices = list(set(col for row, col in row_col_tuples))
+        num_rows = max(row_indices) + 1
+        num_cols = max(col_indices) + 1
+        return num_rows, num_cols
+
+    def get_num_frames(self):
+        frames = set()
+        for t_tree in self.p_t_z_c_tree.values():
+            frames.update(t_tree.keys())
+        return max(frames) + 1
+
+    def get_num_channels(self):
+        return self.num_channels
+
+    def get_num_slices(self):
+        return self.num_slices
 
     def has_image(self, channel_name=None, channel_index=0, z_index=0, t_index=0, pos_index=0):
         """
@@ -395,7 +448,7 @@ class MMDataset:
         if channel_index in self.c_z_t_p_tree and z_index in self.c_z_t_p_tree[channel_index] and \
                 t_index in self.c_z_t_p_tree[channel_index][z_index] and pos_index in \
                 self.c_z_t_p_tree[channel_index][z_index][t_index]:
-            return self.dataset.check_ifd(channel_index=channel_index, z_index=z_index, t_index=t_index, pos_index=pos_index)
+            return self._dataset.check_ifd(channel_index=channel_index, z_index=z_index, t_index=t_index, pos_index=pos_index)
         return False
 
     def read_image(self, channel_name=None, channel_index=0, z_index=0, t_index=0, pos_index=0, read_metadata=False,
@@ -413,9 +466,9 @@ class MMDataset:
         """
         if channel_name is not None:
             channel_index = self._channel_name_to_index(channel_name)
-        return self.dataset.read_image(channel_index, z_index, t_index, pos_index, read_metadata, memmapped)
+        return self._dataset.read_image(channel_index, z_index, t_index, pos_index, read_metadata, memmapped)
 
-    def read_metadata(self, channel_name=None, channel_index=0, z_index=0, t_index=0, pos_index=0, downsample_factor=1):
+    def read_metadata(self, channel_name=None, channel_index=0, z_index=0, t_index=0, pos_index=0):
         """
         Read metadata only. Faster than using read_image to retireve metadata
         :param channel_name: Overrides channel index if supplied
@@ -429,10 +482,10 @@ class MMDataset:
         if channel_name is not None:
             channel_index = self._channel_name_to_index(channel_name)
 
-        return self.dataset.read_metadata(channel_index, z_index, t_index, pos_index)
+        return self._dataset.read_metadata(channel_index, z_index, t_index, pos_index)
 
     def close(self):
-        self.dataset.close()
+        self._dataset.close()
 
     def get_z_slices_at(self, position_index, time_index=0):
         """
@@ -454,28 +507,3 @@ class MMDataset:
                 min_z = min(min_z, *new_zs)
                 max_z = max(max_z, *new_zs)
         return min_z, max_z
-
-    def get_num_xy_positions(self):
-        """
-        :return: total number of xy positons in data set
-        """
-        return len(list(self.p_t_z_c_tree.keys()))
-
-    def get_num_rows_and_cols(self):
-        """
-        Note doesn't  work with explore acquisitions because initial position list isn't populated here
-        :return: tuple with total number of rows, total number of cols in dataset
-        """
-        row_col_tuples = [(pos['GridRowIndex'], pos['GridColumnIndex']) for pos in
-                          self.summary_metadata['InitialPositionList']]
-        row_indices = list(set(row for row, col in row_col_tuples))
-        col_indices = list(set(col for row, col in row_col_tuples))
-        num_rows = max(row_indices) + 1
-        num_cols = max(col_indices) + 1
-        return num_rows, num_cols
-
-    def get_num_frames(self):
-        frames = set()
-        for t_tree in self.p_t_z_c_tree.values():
-            frames.update(t_tree.keys())
-        return max(frames) + 1
